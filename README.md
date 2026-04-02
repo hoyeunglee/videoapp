@@ -1,2 +1,2 @@
 # videoapp
-videoapp is an video exhibition app which people sharing public video
+videoapp is an video exhibition iphone app which people sharing public video
