@@ -1,0 +1,210 @@
+// Assume: g is GraphTraversalSource connected to Neptune
+
+// ---------- Reference data ----------
+
+def ensureCountry = { code, region, policy ->
+  g.V().has('Country', 'country_code', code).
+    fold().
+    coalesce(unfold(),
+             addV('Country')
+               .property('country_code', code)
+               .property('region', region)
+               .property('data_residency_policy', policy)
+    ).next()
+}
+
+def ensureTag = { key, type ->
+  g.V().has('Tag', 'tag_key', key).
+    fold().
+    coalesce(unfold(),
+             addV('Tag')
+               .property('tag_key', key)
+               .property('tag_type', type)
+    ).next()
+}
+
+def ensureCategory = { id, name ->
+  g.V().has('Category', 'category_id', id).
+    fold().
+    coalesce(unfold(),
+             addV('Category')
+               .property('category_id', id)
+               .property('name', name)
+    ).next()
+}
+
+def us = ensureCountry('US','NA','DATA_RESIDENCY_US')
+def de = ensureCountry('DE','EU','DATA_RESIDENCY_EU_STRICT')
+
+def tagMusic   = ensureTag('TOPIC:MUSIC','TOPIC')
+def tagGaming  = ensureTag('TOPIC:GAMING','TOPIC')
+def tagEdu     = ensureTag('TOPIC:EDU','TOPIC')
+def tagPremium = ensureTag('SEGMENT:PREMIUM','SEGMENT')
+
+def catMusic  = ensureCategory('MUSIC','Music')
+def catGaming = ensureCategory('GAMING','Gaming')
+
+// ---------- Helper creators ----------
+
+def createUser = { userId, countryCode, kyc, risk, status ->
+  def now = System.currentTimeMillis()
+  def countryV = g.V().has('Country','country_code',countryCode).next()
+
+  def u = g.V().has('User','user_id',userId).
+    fold().
+    coalesce(unfold(),
+             addV('User')
+               .property('user_id', userId)
+               .property('country_code', countryCode)
+               .property('kyc_level', kyc)
+               .property('risk_score', risk)
+               .property('account_status', status)
+               .property('created_at', now)
+    ).next()
+
+  g.V(u).as('u').
+    coalesce(
+      outE('FROM_COUNTRY').where(inV().hasId(countryV.id())),
+      addE('FROM_COUNTRY').from('u').to(countryV)
+    ).iterate()
+
+  return u
+}
+
+def createChannel = { channelId, title, countryCode, categoryId ->
+  def now = System.currentTimeMillis()
+  def c = g.V().has('Channel','channel_id',channelId).
+    fold().
+    coalesce(unfold(),
+             addV('Channel')
+               .property('channel_id', channelId)
+               .property('title', title)
+               .property('country_code', countryCode)
+               .property('created_at', now)
+    ).next()
+
+  def cat = g.V().has('Category','category_id',categoryId).next()
+  g.addE('BELONGS_TO_CATEGORY').from(c).to(cat).iterate()
+  return c
+}
+
+def createVideo = { videoId, title, durationSec, visibility, channelV, categoryId ->
+  def v = g.V().has('Video','video_id',videoId).
+    fold().
+    coalesce(unfold(),
+             addV('Video')
+               .property('video_id', videoId)
+               .property('title', title)
+               .property('duration_sec', durationSec)
+               .property('visibility', visibility)
+               .property('published_at', System.currentTimeMillis())
+    ).next()
+
+  g.addE('UPLOADED').from(channelV).to(v).iterate()
+
+  def cat = g.V().has('Category','category_id',categoryId).next()
+  g.addE('BELONGS_TO_CATEGORY').from(v).to(cat).iterate()
+
+  return v
+}
+
+def createPlaylist = { playlistId, title, visibility, ownerUser ->
+  g.V().has('Playlist','playlist_id',playlistId).
+    fold().
+    coalesce(unfold(),
+             addV('Playlist')
+               .property('playlist_id', playlistId)
+               .property('title', title)
+               .property('visibility', visibility)
+               .property('created_at', System.currentTimeMillis())
+    ).next()
+}
+
+def addVideoToPlaylist = { playlistV, videoV, position ->
+  g.addE('IN_PLAYLIST').from(playlistV).to(videoV).
+    property('position', position).
+    iterate()
+}
+
+def recordView = { userV, videoV, watchSec, deviceType ->
+  g.addE('VIEWED').from(userV).to(videoV).
+    property('view_at', System.currentTimeMillis()).
+    property('watch_sec', watchSec).
+    property('device_type', deviceType).
+    iterate()
+}
+
+def likeVideo = { userV, videoV ->
+  g.addE('LIKED').from(userV).to(videoV).
+    property('at', System.currentTimeMillis()).
+    iterate()
+}
+
+def subscribeChannel = { userV, channelV ->
+  g.addE('SUBSCRIBES').from(userV).to(channelV).
+    property('since', System.currentTimeMillis()).
+    iterate()
+}
+
+// ---------- Sample data ----------
+
+def u1 = createUser('u1','US','FULL',10,'ACTIVE')
+def u2 = createUser('u2','DE','BASIC',20,'ACTIVE')
+
+def ch1 = createChannel('ch1','Ho Music','US','MUSIC')
+def ch2 = createChannel('ch2','Pro Gaming','DE','GAMING')
+
+def v1 = createVideo('v1','Guitar Tutorial',600,'PUBLIC',ch1,'MUSIC')
+def v2 = createVideo('v2','Live Concert',3600,'PUBLIC',ch1,'MUSIC')
+def v3 = createVideo('v3','FPS Tips',900,'PUBLIC',ch2,'GAMING')
+
+// Tag videos
+g.addE('TAGGED_WITH').from(v1).to(tagMusic).iterate()
+g.addE('TAGGED_WITH').from(v2).to(tagMusic).iterate()
+g.addE('TAGGED_WITH').from(v3).to(tagGaming).iterate()
+
+// Subscriptions
+subscribeChannel(u1, ch1)
+subscribeChannel(u1, ch2)
+subscribeChannel(u2, ch2)
+
+// Views & likes
+recordView(u1, v1, 580, 'IOS')
+recordView(u1, v3, 400, 'IOS')
+recordView(u2, v3, 850, 'ANDROID')
+
+likeVideo(u1, v1)
+likeVideo(u2, v3)
+
+// Playlist
+def pl1 = createPlaylist('pl1','My Mix','PRIVATE',u1)
+addVideoToPlaylist(pl1, v1, 1)
+addVideoToPlaylist(pl1, v3, 2)
+
+
+
+// Videos watched by users who watched v1, ranked by co-view count
+g.V().has('Video','video_id','v1').as('target').
+  in('VIEWED').as('viewer').
+  out('VIEWED').where(neq('target')).as('otherVideo').
+  groupCount().by('video_id').
+  order(local).by(values, decr).
+  limit(local, 10)
+
+
+// Top topic tags for a user based on viewed videos
+g.V().has('User','user_id','u1').
+  out('VIEWED').
+  out('TAGGED_WITH').has('tag_type','TOPIC').
+  groupCount().by('tag_key').
+  order(local).by(values, decr).
+  limit(local, 5)
+
+
+// Simple influence score: subscribers + likes on channel videos
+g.V().hasLabel('Channel').
+  project('channel_id','subs','likes').
+    by('channel_id').
+    by(in('SUBSCRIBES').count()).
+    by(out('UPLOADED').in('LIKED').count())
+

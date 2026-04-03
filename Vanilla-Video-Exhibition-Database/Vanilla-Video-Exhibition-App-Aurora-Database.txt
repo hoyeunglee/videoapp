@@ -1,0 +1,203 @@
+-- ---------- Users & profiles ----------
+
+CREATE EXTENSION IF NOT EXISTS citext;
+
+CREATE TABLE users (
+    id              BIGSERIAL PRIMARY KEY,
+    user_id         VARCHAR(64) UNIQUE NOT NULL,   -- maps to Neptune User.user_id
+    email           CITEXT UNIQUE NOT NULL,
+    email_verified  BOOLEAN NOT NULL DEFAULT FALSE,
+    password_hash   TEXT NOT NULL,
+    status          VARCHAR(32) NOT NULL DEFAULT 'ACTIVE',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE user_profile (
+    user_id         BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    display_name    VARCHAR(128),
+    avatar_url      TEXT,
+    locale          VARCHAR(16),
+    timezone        VARCHAR(64),
+    country_code    CHAR(2),
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- ---------- Channels ----------
+
+CREATE TABLE channels (
+    id              BIGSERIAL PRIMARY KEY,
+    channel_id      VARCHAR(64) UNIQUE NOT NULL,   -- maps to Neptune Channel.channel_id
+    owner_user_id   BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    title           VARCHAR(256) NOT NULL,
+    description     TEXT,
+    country_code    CHAR(2),
+    category        VARCHAR(64),
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_channels_owner ON channels(owner_user_id);
+
+-- ---------- Videos & files ----------
+
+CREATE TABLE videos (
+    id              BIGSERIAL PRIMARY KEY,
+    video_id        VARCHAR(64) UNIQUE NOT NULL,   -- maps to Neptune Video.video_id
+    channel_id      BIGINT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+    title           VARCHAR(256) NOT NULL,
+    description     TEXT,
+    duration_sec    INTEGER NOT NULL,
+    visibility      VARCHAR(16) NOT NULL,         -- PUBLIC/UNLISTED/PRIVATE
+    language        VARCHAR(16),
+    age_restricted  BOOLEAN NOT NULL DEFAULT FALSE,
+    thumbnail_url   TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    published_at    TIMESTAMPTZ,
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_videos_channel ON videos(channel_id);
+CREATE INDEX idx_videos_visibility ON videos(visibility);
+
+CREATE TABLE video_files (
+    id              BIGSERIAL PRIMARY KEY,
+    video_id        BIGINT NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
+    storage_key     TEXT NOT NULL,                -- S3 key
+    resolution      VARCHAR(16) NOT NULL,         -- 1080p, 720p, etc.
+    codec           VARCHAR(32),
+    bitrate_kbps    INTEGER,
+    size_bytes      BIGINT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (video_id, resolution)
+);
+
+-- ---------- Tags & categories ----------
+
+CREATE TABLE tags (
+    id          BIGSERIAL PRIMARY KEY,
+    tag_key     VARCHAR(128) UNIQUE NOT NULL,
+    tag_type    VARCHAR(32) NOT NULL
+);
+
+CREATE TABLE video_tags (
+    video_id    BIGINT NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
+    tag_id      BIGINT NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+    PRIMARY KEY (video_id, tag_id)
+);
+
+CREATE TABLE categories (
+    id          BIGSERIAL PRIMARY KEY,
+    category_id VARCHAR(64) UNIQUE NOT NULL,
+    name        VARCHAR(128) NOT NULL
+);
+
+CREATE TABLE video_categories (
+    video_id    BIGINT NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
+    category_id BIGINT NOT NULL REFERENCES categories(id) ON DELETE CASCADE,
+    PRIMARY KEY (video_id, category_id)
+);
+
+-- ---------- Subscriptions ----------
+
+CREATE TABLE subscriptions (
+    id              BIGSERIAL PRIMARY KEY,
+    subscriber_id   BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    channel_id      BIGINT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (subscriber_id, channel_id)
+);
+
+CREATE INDEX idx_subscriptions_channel ON subscriptions(channel_id);
+
+-- ---------- Engagement (relational view) ----------
+
+CREATE TABLE video_likes (
+    id              BIGSERIAL PRIMARY KEY,
+    user_id         BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    video_id        BIGINT NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
+    is_like         BOOLEAN NOT NULL,             -- true=like, false=dislike
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (user_id, video_id)
+);
+
+CREATE INDEX idx_video_likes_video ON video_likes(video_id);
+
+CREATE TABLE comments (
+    id              BIGSERIAL PRIMARY KEY,
+    video_id        BIGINT NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
+    user_id         BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    parent_id       BIGINT REFERENCES comments(id) ON DELETE CASCADE,
+    body            TEXT NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_comments_video ON comments(video_id);
+
+CREATE TABLE playlists (
+    id              BIGSERIAL PRIMARY KEY,
+    playlist_id     VARCHAR(64) UNIQUE NOT NULL,  -- maps to Neptune Playlist.playlist_id
+    owner_user_id   BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    title           VARCHAR(256) NOT NULL,
+    description     TEXT,
+    visibility      VARCHAR(16) NOT NULL,         -- PUBLIC/PRIVATE/UNLISTED
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE playlist_items (
+    id              BIGSERIAL PRIMARY KEY,
+    playlist_id     BIGINT NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
+    video_id        BIGINT NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
+    position        INTEGER NOT NULL,
+    added_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (playlist_id, video_id)
+);
+
+-- ---------- Views (aggregated-friendly) ----------
+
+CREATE TABLE video_views (
+    id              BIGSERIAL PRIMARY KEY,
+    video_id        BIGINT NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
+    user_id         BIGINT REFERENCES users(id) ON DELETE SET NULL,
+    session_id      VARCHAR(128),
+    watch_sec       INTEGER NOT NULL,
+    device_type     VARCHAR(16),
+    country_code    CHAR(2),
+    viewed_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_video_views_video ON video_views(video_id);
+CREATE INDEX idx_video_views_user ON video_views(user_id);
+
+-- ---------- Simple stats snapshot ----------
+
+CREATE TABLE video_stats (
+    video_id        BIGINT PRIMARY KEY REFERENCES videos(id) ON DELETE CASCADE,
+    view_count      BIGINT NOT NULL DEFAULT 0,
+    like_count      BIGINT NOT NULL DEFAULT 0,
+    dislike_count   BIGINT NOT NULL DEFAULT 0,
+    comment_count   BIGINT NOT NULL DEFAULT 0,
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- ---------- Audit log ----------
+
+CREATE TABLE audit_log (
+    id              BIGSERIAL PRIMARY KEY,
+    user_id         BIGINT REFERENCES users(id) ON DELETE SET NULL,
+    actor_type      VARCHAR(32) NOT NULL,  -- USER/SYSTEM/ADMIN
+    actor_id        VARCHAR(128),
+    action          VARCHAR(64) NOT NULL,  -- 'VIDEO_UPLOAD','VIDEO_DELETE','SUBSCRIBE','LIKE'
+    resource_type   VARCHAR(64) NOT NULL,  -- 'VIDEO','CHANNEL','PLAYLIST','USER'
+    resource_id     VARCHAR(128),
+    metadata        JSONB,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_audit_action ON audit_log(action);
+CREATE INDEX idx_audit_resource ON audit_log(resource_type, resource_id);
+
+
