@@ -1,0 +1,22 @@
+body {
+  margin: 0;
+  padding: 0;
+  font-family: sans-serif;
+  background: #fafafa;
+}
+
+.video-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 16px;
+}
+
+.video-card {
+  text-decoration: none;
+  color: black;
+}
+
+.thumb {
+  width: 100%;
+  border-radius: 8px;
+}
