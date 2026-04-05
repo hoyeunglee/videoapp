@@ -58,6 +58,199 @@ struct Comment: Identifiable, Hashable {
     }
 }
 
+fileprivate func formatDuration(_ seconds: TimeInterval) -> String {
+    let total = Int(seconds)
+    let h = total / 3600
+    let m = (total % 3600) / 60
+    let s = total % 60
+    if h > 0 { return String(format: "%d:%02d:%02d", h, m, s) }
+    return String(format: "%d:%02d", m, s)
+}
+
+fileprivate func timeAgoString(from date: Date) -> String {
+    let interval = Int(Date().timeIntervalSince(date))
+    let minute = 60, hour = 3600, day = 86400, week = 604800, month = 2592000, year = 31536000
+    switch interval {
+    case 0..<minute: return "just now"
+    case minute..<hour: return "\(interval / minute)m ago"
+    case hour..<day: return "\(interval / hour)h ago"
+    case day..<week: return "\(interval / day)d ago"
+    case week..<month: return "\(interval / week)w ago"
+    case month..<year: return "\(interval / month)mo ago"
+    default: return "\(interval / year)y ago"
+    }
+}
+
+// MARK: - Security & Privacy
+
+struct PrivacySettings {
+    static let blockedSchemes: Set<String> = ["javascript", "data", "file", "about", "ws", "wss", "ftp"]
+    static let trackingQueryPrefixes: [String] = ["utm_", "gclid", "fbclid", "mc_eid", "mc_cid"]
+    static let suspiciousHostSubstrings: [String] = ["doubleclick", "googlesyndication", "adservice", "adsystem", "ads.", ".ads", "tracking", "pixel"]
+    static let allowedVideoExtensions: Set<String> = ["mp4", "m4v", "mov", "webm", "mkv"]
+    static let maxDownloadBytes: Int64 = 500 * 1024 * 1024 // 500 MB
+
+    static let allowedImageExtensions: Set<String> = ["jpg", "jpeg", "png", "gif", "webp", "heic"]
+    static let maxImageBytes: Int64 = 20 * 1024 * 1024 // 20 MB
+    static let maxUploadBytes: Int64 = 500 * 1024 * 1024 // 500 MB
+}
+
+fileprivate func sanitizeAndValidateURL(_ url: URL) -> URL? {
+    // Only allow http/https
+    guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return nil }
+    guard let scheme = components.scheme?.lowercased(), ["http", "https"].contains(scheme) else { return nil }
+
+    // Block suspicious hosts
+    guard let host = components.host?.lowercased(), !host.isEmpty else { return nil }
+    for s in PrivacySettings.suspiciousHostSubstrings where host.contains(s) { return nil }
+
+    // Drop fragment and strip common tracking query parameters
+    components.fragment = nil
+    if let items = components.queryItems, !items.isEmpty {
+        components.queryItems = items.filter { item in
+            let name = item.name.lowercased()
+            return !PrivacySettings.trackingQueryPrefixes.contains { prefix in name.hasPrefix(prefix) }
+        }
+        if components.queryItems?.isEmpty == true { components.queryItems = nil }
+    }
+
+    return components.url
+}
+
+fileprivate func isLikelyVideoResponse(contentType: String?, url: URL) -> Bool {
+    if let ct = contentType?.lowercased() {
+        if ct.hasPrefix("video/") { return true }
+        if ct == "application/octet-stream" { return true }
+        if ct.contains("text/html") || ct.contains("javascript") { return false }
+    }
+    let ext = url.pathExtension.lowercased()
+    return PrivacySettings.allowedVideoExtensions.contains(ext)
+}
+
+fileprivate func isLikelyImageResponse(contentType: String?, url: URL) -> Bool {
+    if let ct = contentType?.lowercased() {
+        if ct.hasPrefix("image/") { return true }
+        if ct.contains("text/html") || ct.contains("javascript") { return false }
+    }
+    let ext = url.pathExtension.lowercased()
+    return PrivacySettings.allowedImageExtensions.contains(ext)
+}
+
+actor SecureVideoLoader {
+    static let shared = SecureVideoLoader()
+
+    func fetchPlayableURL(from original: URL) async throws -> URL {
+        guard let safeURL = sanitizeAndValidateURL(original) else {
+            throw URLError(.badURL)
+        }
+
+        var request = URLRequest(url: safeURL)
+        request.httpMethod = "GET"
+        request.setValue("video/*,application/octet-stream;q=0.9", forHTTPHeaderField: "Accept")
+        request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        request.timeoutInterval = 60
+
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.httpCookieAcceptPolicy = .never
+        cfg.httpShouldSetCookies = false
+        cfg.httpCookieStorage = nil
+        cfg.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        cfg.waitsForConnectivity = false
+
+        let session = URLSession(configuration: cfg)
+        let (tempURL, response) = try await session.download(for: request)
+
+        // Enforce size limit even if Content-Length was missing
+        let fmCheck = FileManager.default
+        if let attrs = try? fmCheck.attributesOfItem(atPath: tempURL.path),
+           let fileSize = attrs[.size] as? NSNumber,
+           fileSize.int64Value > PrivacySettings.maxDownloadBytes {
+            throw URLError(.dataLengthExceedsMaximum)
+        }
+
+        guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+        guard (200...206).contains(http.statusCode) else { throw URLError(.badServerResponse) }
+
+        if let host = safeURL.host?.lowercased() {
+            for s in PrivacySettings.suspiciousHostSubstrings where host.contains(s) {
+                throw URLError(.cannotLoadFromNetwork)
+            }
+        }
+
+        let contentType = http.value(forHTTPHeaderField: "Content-Type")
+        guard isLikelyVideoResponse(contentType: contentType, url: safeURL) else {
+            throw URLError(.cannotDecodeContentData)
+        }
+
+        if let lenStr = http.value(forHTTPHeaderField: "Content-Length"),
+           let len = Int64(lenStr), len > PrivacySettings.maxDownloadBytes {
+            throw URLError(.dataLengthExceedsMaximum)
+        }
+
+        // Persist to a stable temp location
+        let fm = FileManager.default
+        let ext = safeURL.pathExtension.isEmpty ? "mp4" : safeURL.pathExtension
+        let dest = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString).appendingPathExtension(ext)
+        do {
+            try? fm.removeItem(at: dest)
+            try fm.moveItem(at: tempURL, to: dest)
+        } catch {
+            try fm.copyItem(at: tempURL, to: dest)
+        }
+        return dest
+    }
+}
+
+actor SecureImageLoader {
+    static let shared = SecureImageLoader()
+
+    func fetchImageData(from original: URL) async throws -> Data {
+        guard let safeURL = sanitizeAndValidateURL(original) else {
+            throw URLError(.badURL)
+        }
+        var request = URLRequest(url: safeURL)
+        request.httpMethod = "GET"
+        request.setValue("image/*", forHTTPHeaderField: "Accept")
+        request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        request.timeoutInterval = 30
+
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.httpCookieAcceptPolicy = .never
+        cfg.httpShouldSetCookies = false
+        cfg.httpCookieStorage = nil
+        cfg.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        cfg.waitsForConnectivity = false
+
+        let session = URLSession(configuration: cfg)
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse, (200...206).contains(http.statusCode) else {
+            throw URLError(.badServerResponse)
+        }
+        let contentType = http.value(forHTTPHeaderField: "Content-Type")
+        guard isLikelyImageResponse(contentType: contentType, url: safeURL) else {
+            throw URLError(.cannotDecodeContentData)
+        }
+        if data.count > Int(PrivacySettings.maxImageBytes) {
+            throw URLError(.dataLengthExceedsMaximum)
+        }
+        return data
+    }
+}
+
+fileprivate func cleanUserText(_ text: String, maxLength: Int = 500) -> String {
+    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    let filteredScalars = trimmed.unicodeScalars.filter { scalar in
+        // Remove control characters and non-characters
+        return !CharacterSet.controlCharacters.contains(scalar)
+    }
+    let cleaned = String(String.UnicodeScalarView(filteredScalars))
+    if cleaned.count > maxLength {
+        let idx = cleaned.index(cleaned.startIndex, offsetBy: maxLength)
+        return String(cleaned[..<idx])
+    }
+    return cleaned
+}
+
 // MARK: - Services (Mock AWS Upload)
 @MainActor
 final class CloudUploadService: ObservableObject {
@@ -71,9 +264,13 @@ final class CloudUploadService: ObservableObject {
             try? await Task.sleep(nanoseconds: 200_000_000)
             self.state = .uploading(progress: Double(i) / 10.0)
         }
-        // Simulate a remote URL after uploading
-        let url = URL(string: "https://example-bucket.s3.amazonaws.com/\(fileName)")!
-        self.state = .success(url)
+        // Simulate a remote URL after uploading (sanitize filename and avoid force-unwrap)
+        let safeName = fileName.replacingOccurrences(of: "[^A-Za-z0-9._-]", with: "_", options: .regularExpression)
+        if let url = URL(string: "https://example-bucket.s3.amazonaws.com/\(safeName)") {
+            self.state = .success(url)
+        } else {
+            self.state = .failure("Invalid file name")
+        }
     }
 
     func reset() { state = .idle }
@@ -107,29 +304,7 @@ final class AppState: ObservableObject {
         )
     ]
     @Published var isLoggedIn: Bool = false
-}
-
-fileprivate func formatDuration(_ seconds: TimeInterval) -> String {
-    let total = Int(seconds)
-    let h = total / 3600
-    let m = (total % 3600) / 60
-    let s = total % 60
-    if h > 0 { return String(format: "%d:%02d:%02d", h, m, s) }
-    return String(format: "%d:%02d", m, s)
-}
-
-fileprivate func timeAgoString(from date: Date) -> String {
-    let interval = Int(Date().timeIntervalSince(date))
-    let minute = 60, hour = 3600, day = 86400, week = 604800, month = 2592000, year = 31536000
-    switch interval {
-    case 0..<minute: return "just now"
-    case minute..<hour: return "\(interval / minute)m ago"
-    case hour..<day: return "\(interval / hour)h ago"
-    case day..<week: return "\(interval / day)d ago"
-    case week..<month: return "\(interval / week)w ago"
-    case month..<year: return "\(interval / month)mo ago"
-    default: return "\(interval / year)y ago"
-    }
+    @Published var privacyModeEnabled: Bool = true
 }
 
 // MARK: - Reusable Confirm Transition
@@ -168,6 +343,10 @@ struct ContentView: View {
                 .environmentObject(appState)
                 .navigationTitle("Videos")
                 .toolbar {
+                    ToolbarItem(placement: .topBarTrailing) {
+                        PrivacyToggle()
+                            .environmentObject(appState)
+                    }
                     ToolbarItem(placement: .topBarTrailing) {
                         LoginLink()
                             .environmentObject(appState)
@@ -209,6 +388,42 @@ struct HomeView: View {
     }
 }
 
+struct SecureAsyncImage: View {
+    let url: URL
+    let placeholder: AnyView
+    @State private var image: Image? = nil
+
+    var body: some View {
+        Group {
+            if let img = image {
+                img.resizable().scaledToFill()
+            } else {
+                placeholder
+            }
+        }
+        .task(id: url) {
+            await load()
+        }
+    }
+
+    private func load() async {
+        do {
+            let data = try await SecureImageLoader.shared.fetchImageData(from: url)
+            #if canImport(UIKit)
+            if let ui = UIImage(data: data) {
+                image = Image(uiImage: ui)
+            }
+            #elseif canImport(AppKit)
+            if let ns = NSImage(data: data) {
+                image = Image(nsImage: ns)
+            }
+            #endif
+        } catch {
+            // keep placeholder
+        }
+    }
+}
+
 struct VideoCardView: View {
     let video: Video
 
@@ -217,18 +432,7 @@ struct VideoCardView: View {
             ZStack(alignment: .bottomTrailing) {
                 Group {
                     if let thumb = video.thumbnailURL {
-                        AsyncImage(url: thumb) { phase in
-                            switch phase {
-                            case .success(let image):
-                                image.resizable().scaledToFill()
-                            case .failure(_):
-                                placeholder
-                            case .empty:
-                                placeholder.redacted(reason: .placeholder)
-                            @unknown default:
-                                placeholder
-                            }
-                        }
+                        SecureAsyncImage(url: thumb, placeholder: AnyView(placeholder.redacted(reason: .placeholder)))
                     } else {
                         placeholder
                     }
@@ -276,13 +480,17 @@ struct VideoDetailView: View {
     @EnvironmentObject var appState: AppState
     @State var video: Video
 
+    @State private var player: AVPlayer? = nil
+    @State private var isBlockingAlert = false
+    @State private var blockingMessage = ""
+
     @State private var newComment: String = ""
     @State private var showBackConfirm = false
 
     var body: some View {
         VStack(spacing: 16) {
-            if let url = video.url {
-                VideoPlayer(player: AVPlayer(url: url))
+            if let p = player {
+                VideoPlayer(player: p)
                     .frame(height: 220)
             } else {
                 ZStack {
@@ -335,21 +543,63 @@ struct VideoDetailView: View {
             // Workaround: use dismiss
             dismiss()
         }
+        .onAppear { Task { await preparePlayer() } }
+        .onChange(of: appState.privacyModeEnabled) { _ in Task { await preparePlayer() } }
+        .onChange(of: video.url) { _ in Task { await preparePlayer() } }
+        .onChange(of: newComment) { newValue in
+            newComment = cleanUserText(newValue)
+        }
+        .alert("Cannot Play", isPresented: $isBlockingAlert) {
+            Button("OK", role: .cancel) { }
+        } message: {
+            Text(blockingMessage)
+        }
     }
 
     @Environment(\.dismiss) private var dismiss
 
+    private func preparePlayer() async {
+        guard let original = video.url else { return }
+        guard let sanitized = sanitizeAndValidateURL(original) else {
+            await MainActor.run {
+                blockingMessage = "Blocked potentially unsafe or non-video link."
+                isBlockingAlert = true
+                player = nil
+            }
+            return
+        }
+        do {
+            let urlToPlay: URL
+            if appState.privacyModeEnabled {
+                urlToPlay = try await SecureVideoLoader.shared.fetchPlayableURL(from: sanitized)
+            } else {
+                urlToPlay = sanitized
+            }
+            await MainActor.run {
+                player = AVPlayer(url: urlToPlay)
+            }
+        } catch {
+            await MainActor.run {
+                blockingMessage = "Blocked or failed to load video. \(error.localizedDescription)"
+                isBlockingAlert = true
+                player = nil
+            }
+        }
+    }
+
     private func incrementViewCount() {
         if let index = appState.videos.firstIndex(where: { $0.id == video.id }) {
-            appState.videos[index].viewCount += 1
+            if appState.videos[index].viewCount < Int.max {
+                appState.videos[index].viewCount += 1
+            }
             video.viewCount = appState.videos[index].viewCount
         }
     }
 
     private func addComment() {
-        let trimmed = newComment.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        let comment = Comment(author: appState.isLoggedIn ? "You" : "Guest", text: trimmed)
+        let cleaned = cleanUserText(newComment)
+        guard !cleaned.isEmpty else { return }
+        let comment = Comment(author: appState.isLoggedIn ? "You" : "Guest", text: cleaned)
         if let index = appState.videos.firstIndex(where: { $0.id == video.id }) {
             appState.videos[index].comments.append(comment)
             video.comments.append(comment)
@@ -402,6 +652,10 @@ struct UploadView: View {
                 case .idle:
                     Button("Upload to Cloud") {
                         guard let data = pickedVideoData else { return }
+                        if data.count > Int(PrivacySettings.maxUploadBytes) {
+                            uploader.state = .failure("File too large")
+                            return
+                        }
                         Task { await uploader.upload(data: data, fileName: (title.isEmpty ? "untitled" : title) + ".mp4") }
                     }
                     .disabled(pickedVideoData == nil)
@@ -447,6 +701,24 @@ struct LoginLink: View {
     }
 }
 
+struct PrivacyToggle: View {
+    @EnvironmentObject var appState: AppState
+
+    var body: some View {
+        Menu {
+            Toggle(isOn: $appState.privacyModeEnabled) {
+                Label("Privacy Mode", systemImage: appState.privacyModeEnabled ? "lock.shield.fill" : "lock.shield")
+            }
+            Text("When enabled, the app downloads videos using an ephemeral session (no cookies), strips tracking parameters, and blocks non-video/advertising links.")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+        } label: {
+            Image(systemName: appState.privacyModeEnabled ? "lock.shield.fill" : "lock.shield")
+        }
+        .accessibilityLabel("Privacy Mode")
+    }
+}
+
 struct LoginView: View {
     @EnvironmentObject var appState: AppState
     @State private var username: String = ""
@@ -458,7 +730,12 @@ struct LoginView: View {
         Form {
             Section("Account") {
                 TextField("Username", text: $username)
+                    .textContentType(.username)
+                    .autocorrectionDisabled(true)
+                    .textInputAutocapitalization(.never)
                 SecureField("Password", text: $password)
+                    .textContentType(.password)
+                    .autocorrectionDisabled(true)
             }
             Section {
                 Button(appState.isLoggedIn ? "Sign Out" : "Sign In") {
